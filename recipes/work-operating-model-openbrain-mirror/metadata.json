@@ -1,0 +1,20 @@
+{
+  "name": "Work Operating Model → OpenBrain Mirror",
+  "description": "Postgres triggers that mirror every work-operating-model entry and approved layer summary into the core OpenBrain `thoughts` table, so the universal `thoughts` index sees the structured operating model automatically.",
+  "category": "recipes",
+  "author": {
+    "name": "Stephanie Hogue",
+    "github": "stephaniehogue1"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": ["Supabase"],
+    "tools": []
+  },
+  "tags": ["operating-model", "mirror", "trigger", "thoughts", "indexing", "unification"],
+  "difficulty": "beginner",
+  "estimated_time": "5 minutes",
+  "created": "2026-05-18",
+  "updated": "2026-05-18"
+}
