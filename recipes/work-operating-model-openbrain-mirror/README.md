@@ -1,17 +1,21 @@
 # Work Operating Model → OpenBrain Mirror
 
-> Make the core `thoughts` table the universal index. Every Work Operating Model entry and approved layer summary is mirrored into `thoughts` automatically via Postgres triggers, so `list_thoughts`, `thought_stats`, and metadata-filtered queries see your operating model alongside everything else.
+> Make the core `thoughts` table the universal index. Every Work Operating Model entry and approved layer summary is mirrored into `thoughts` automatically via Postgres triggers, with an explicit foreign key column so the relationship is visible in the Schema Visualizer.
 
 ## What It Does
 
 The [Work Operating Model Activation](../work-operating-model-activation/) recipe stores rich structured data in its own tables (`operating_model_entries`, `operating_model_layer_checkpoints`, etc.). Those tables are excellent for layer-aware queries and export generation, but they are invisible to the core OpenBrain MCP tools, which only read from `thoughts`.
 
-This recipe adds two `AFTER INSERT/UPDATE/DELETE` triggers that maintain a thought-shaped projection of each row in `thoughts`:
+This recipe creates a two-way connection:
+
+1. **A foreign key column** — `mirrored_thought_id BIGINT REFERENCES thoughts(id) ON DELETE SET NULL` is added to both WOM tables. Visible in **Database → Schema Visualizer**.
+
+2. **Database triggers** — On every INSERT/UPDATE/DELETE the WOM table receives, the corresponding row in `thoughts` is created/updated/removed, and the FK is populated. Same transaction; cannot drift.
 
 | Source row | Mirror thought | `metadata.type` |
 |---|---|---|
 | `operating_model_entries` (canonical entries) | one thought per entry | `operating_model_entry` |
-| `operating_model_layer_checkpoints` (approved layer summaries) | one thought per approved checkpoint | `operating_model_summary` |
+| `operating_model_layer_checkpoints` (approved layer summaries only) | one thought per approved checkpoint | `operating_model_summary` |
 
 The mirror is enforced at the database level, so it can't drift — direct edits in the Supabase dashboard, future MCP servers writing to the WOM tables, and backfills all flow through the same projection.
 
@@ -123,17 +127,24 @@ Solution: Check `operating_model_layer_checkpoints` — only `status = 'approved
 Solution: Add an embedding backfill (see the caveat section above). Without embeddings, `search_thoughts` will skip these rows.
 
 **Issue: I want to undo the mirror**
-Solution: Drop the triggers and helper functions, then delete the mirror rows:
+Solution: Drop the triggers, helper functions, and FK columns, then delete the mirror rows:
 
 ```sql
-DROP TRIGGER IF EXISTS wom_mirror_entry_trigger ON operating_model_entries;
-DROP TRIGGER IF EXISTS wom_mirror_checkpoint_trigger ON operating_model_layer_checkpoints;
+DROP TRIGGER IF EXISTS wom_mirror_entry_biud_trigger ON operating_model_entries;
+DROP TRIGGER IF EXISTS wom_mirror_entry_ad_trigger ON operating_model_entries;
+DROP TRIGGER IF EXISTS wom_mirror_checkpoint_biud_trigger ON operating_model_layer_checkpoints;
+DROP TRIGGER IF EXISTS wom_mirror_checkpoint_ad_trigger ON operating_model_layer_checkpoints;
 DROP FUNCTION IF EXISTS wom_mirror_entry();
+DROP FUNCTION IF EXISTS wom_mirror_entry_delete();
 DROP FUNCTION IF EXISTS wom_mirror_checkpoint();
+DROP FUNCTION IF EXISTS wom_mirror_checkpoint_delete();
 DROP FUNCTION IF EXISTS wom_compose_entry_content(operating_model_entries);
 DROP FUNCTION IF EXISTS wom_compose_entry_metadata(operating_model_entries);
 DROP FUNCTION IF EXISTS wom_compose_checkpoint_content(operating_model_layer_checkpoints);
 DROP FUNCTION IF EXISTS wom_compose_checkpoint_metadata(operating_model_layer_checkpoints);
+
+ALTER TABLE operating_model_entries DROP COLUMN IF EXISTS mirrored_thought_id;
+ALTER TABLE operating_model_layer_checkpoints DROP COLUMN IF EXISTS mirrored_thought_id;
 
 DELETE FROM thoughts WHERE metadata @> '{"source": "work_operating_model"}'::jsonb;
 ```
