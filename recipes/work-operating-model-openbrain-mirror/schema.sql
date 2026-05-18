@@ -1,20 +1,30 @@
 -- ============================================
--- Work Operating Model → OpenBrain Mirror
+-- Work Operating Model → OpenBrain Mirror (v1.1)
 -- ============================================
 -- Adds database triggers that mirror every work-operating-model entry and
--- layer checkpoint into the core OpenBrain `thoughts` table. After this
--- runs, anything captured by the Work Operating Model workflow is visible
--- to `list_thoughts`, `thought_stats`, and any JSONB/metadata-filtered
+-- approved layer checkpoint into the core OpenBrain `thoughts` table. The
+-- relationship is enforced two ways:
+--
+--   1. An explicit foreign key: `mirrored_thought_id BIGINT REFERENCES
+--      thoughts(id) ON DELETE SET NULL` on `operating_model_entries` and
+--      `operating_model_layer_checkpoints`. Visible in the Schema
+--      Visualizer.
+--
+--   2. Postgres triggers that maintain that FK and the mirror row
+--      automatically on every INSERT / UPDATE / DELETE.
+--
+-- After this runs, anything captured by the Work Operating Model workflow
+-- is visible to `list_thoughts`, `thought_stats`, and any metadata-filtered
 -- query against `thoughts` — automatically, with no application code path
 -- required.
 --
 -- Caveat: SQL triggers cannot call OpenRouter, so mirrored rows have
 -- NULL `embedding`. They will NOT appear in `search_thoughts` (semantic
--- vector search) until an embedding backfill runs. See the recipe README
--- for the backfill pattern.
+-- vector search) until an embedding backfill runs. See
+-- `recipes/embedding-backfill/` for the scheduled-cron solution.
 --
 -- Idempotent — safe to re-run. The one-time backfill at the bottom only
--- inserts rows that don't already have a mirror.
+-- inserts/links rows that don't already have a mirror.
 --
 -- Prerequisite: `recipes/work-operating-model-activation` schema applied
 -- (the `operating_model_*` tables must exist). The `thoughts` table from
@@ -25,7 +35,53 @@
 
 
 -- --------------------------------------------
--- Helper: build a thought row from a WOM entry
+-- 1. Add the FK columns (idempotent)
+-- --------------------------------------------
+ALTER TABLE operating_model_entries
+  ADD COLUMN IF NOT EXISTS mirrored_thought_id BIGINT
+    REFERENCES thoughts(id) ON DELETE SET NULL;
+
+ALTER TABLE operating_model_layer_checkpoints
+  ADD COLUMN IF NOT EXISTS mirrored_thought_id BIGINT
+    REFERENCES thoughts(id) ON DELETE SET NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ome_mirrored_thought_id
+  ON operating_model_entries(mirrored_thought_id)
+  WHERE mirrored_thought_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_omc_mirrored_thought_id
+  ON operating_model_layer_checkpoints(mirrored_thought_id)
+  WHERE mirrored_thought_id IS NOT NULL;
+
+
+-- --------------------------------------------
+-- 2. Backfill the FK from any existing metadata.source_id linkage
+--    (handles upgrade from v1.0 of this recipe)
+-- --------------------------------------------
+UPDATE operating_model_entries e
+SET mirrored_thought_id = t.id
+FROM thoughts t
+WHERE e.mirrored_thought_id IS NULL
+  AND t.metadata @> jsonb_build_object(
+    'source', 'work_operating_model',
+    'source_table', 'operating_model_entries',
+    'source_id', e.id::text
+  );
+
+UPDATE operating_model_layer_checkpoints c
+SET mirrored_thought_id = t.id
+FROM thoughts t
+WHERE c.mirrored_thought_id IS NULL
+  AND c.status = 'approved'
+  AND t.metadata @> jsonb_build_object(
+    'source', 'work_operating_model',
+    'source_table', 'operating_model_layer_checkpoints',
+    'source_id', c.id::text
+  );
+
+
+-- --------------------------------------------
+-- 3. Helpers — compose thought row from a WOM row
 -- --------------------------------------------
 CREATE OR REPLACE FUNCTION wom_compose_entry_content(p_row operating_model_entries)
 RETURNS TEXT AS $$
@@ -78,7 +134,6 @@ BEGIN
     'source_confidence', p_row.source_confidence
   );
 
-  -- friction layer carries a priority in details — expose it for filtering
   IF p_row.layer = 'friction' AND p_row.details ? 'priority' THEN
     v_meta := v_meta || jsonb_build_object(
       'friction_priority', p_row.details->>'priority'
@@ -90,66 +145,6 @@ END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
 
--- --------------------------------------------
--- Trigger: mirror operating_model_entries
--- --------------------------------------------
-CREATE OR REPLACE FUNCTION wom_mirror_entry()
-RETURNS TRIGGER AS $$
-DECLARE
-  v_match JSONB;
-  v_updated INTEGER;
-BEGIN
-  IF TG_OP = 'DELETE' THEN
-    DELETE FROM thoughts
-    WHERE metadata @> jsonb_build_object(
-      'source', 'work_operating_model',
-      'source_table', 'operating_model_entries',
-      'source_id', OLD.id::text
-    );
-    RETURN OLD;
-  END IF;
-
-  v_match := jsonb_build_object(
-    'source', 'work_operating_model',
-    'source_table', 'operating_model_entries',
-    'source_id', NEW.id::text
-  );
-
-  IF TG_OP = 'UPDATE' THEN
-    UPDATE thoughts
-       SET content  = wom_compose_entry_content(NEW),
-           metadata = wom_compose_entry_metadata(NEW)
-     WHERE metadata @> v_match;
-    GET DIAGNOSTICS v_updated = ROW_COUNT;
-
-    IF v_updated > 0 THEN
-      RETURN NEW;
-    END IF;
-    -- fall through to INSERT if no mirror row exists yet
-  END IF;
-
-  INSERT INTO thoughts (content, metadata)
-  VALUES (
-    wom_compose_entry_content(NEW),
-    wom_compose_entry_metadata(NEW)
-  );
-
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-
-DROP TRIGGER IF EXISTS wom_mirror_entry_trigger ON operating_model_entries;
-CREATE TRIGGER wom_mirror_entry_trigger
-  AFTER INSERT OR UPDATE OR DELETE ON operating_model_entries
-  FOR EACH ROW
-  EXECUTE FUNCTION wom_mirror_entry();
-
-
--- --------------------------------------------
--- Trigger: mirror operating_model_layer_checkpoints
--- (layer summary rows — one per (session, layer))
--- --------------------------------------------
 CREATE OR REPLACE FUNCTION wom_compose_checkpoint_content(p_row operating_model_layer_checkpoints)
 RETURNS TEXT AS $$
 BEGIN
@@ -180,111 +175,219 @@ END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
 
-CREATE OR REPLACE FUNCTION wom_mirror_checkpoint()
+-- --------------------------------------------
+-- 4. Trigger functions (v1.1 — FK-based)
+-- --------------------------------------------
+
+-- entries: BEFORE INSERT/UPDATE writes the mirror and stamps the FK on NEW
+CREATE OR REPLACE FUNCTION wom_mirror_entry()
 RETURNS TRIGGER AS $$
 DECLARE
-  v_match JSONB;
-  v_updated INTEGER;
+  v_thought_id BIGINT;
 BEGIN
-  IF TG_OP = 'DELETE' THEN
-    DELETE FROM thoughts
-    WHERE metadata @> jsonb_build_object(
-      'source', 'work_operating_model',
-      'source_table', 'operating_model_layer_checkpoints',
-      'source_id', OLD.id::text
-    );
-    RETURN OLD;
-  END IF;
-
-  -- only mirror approved checkpoints; superseded/draft are noise
-  IF NEW.status <> 'approved' THEN
-    DELETE FROM thoughts
-    WHERE metadata @> jsonb_build_object(
-      'source', 'work_operating_model',
-      'source_table', 'operating_model_layer_checkpoints',
-      'source_id', NEW.id::text
-    );
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO thoughts (content, metadata)
+    VALUES (
+      wom_compose_entry_content(NEW),
+      wom_compose_entry_metadata(NEW)
+    )
+    RETURNING id INTO v_thought_id;
+    NEW.mirrored_thought_id := v_thought_id;
     RETURN NEW;
   END IF;
 
-  v_match := jsonb_build_object(
-    'source', 'work_operating_model',
-    'source_table', 'operating_model_layer_checkpoints',
-    'source_id', NEW.id::text
-  );
+  -- UPDATE
+  IF NEW.mirrored_thought_id IS NOT NULL THEN
+    UPDATE thoughts
+       SET content  = wom_compose_entry_content(NEW),
+           metadata = wom_compose_entry_metadata(NEW)
+     WHERE id = NEW.mirrored_thought_id;
 
-  IF TG_OP = 'UPDATE' THEN
+    IF FOUND THEN
+      RETURN NEW;
+    END IF;
+    -- thought was deleted out from under us; fall through and re-create
+  END IF;
+
+  INSERT INTO thoughts (content, metadata)
+  VALUES (
+    wom_compose_entry_content(NEW),
+    wom_compose_entry_metadata(NEW)
+  )
+  RETURNING id INTO v_thought_id;
+  NEW.mirrored_thought_id := v_thought_id;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- entries: AFTER DELETE cleans up the mirror
+CREATE OR REPLACE FUNCTION wom_mirror_entry_delete()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF OLD.mirrored_thought_id IS NOT NULL THEN
+    DELETE FROM thoughts WHERE id = OLD.mirrored_thought_id;
+  END IF;
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- checkpoints: same shape, but only `approved` rows get mirrored
+CREATE OR REPLACE FUNCTION wom_mirror_checkpoint()
+RETURNS TRIGGER AS $$
+DECLARE
+  v_thought_id BIGINT;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.status = 'approved' THEN
+      INSERT INTO thoughts (content, metadata)
+      VALUES (
+        wom_compose_checkpoint_content(NEW),
+        wom_compose_checkpoint_metadata(NEW)
+      )
+      RETURNING id INTO v_thought_id;
+      NEW.mirrored_thought_id := v_thought_id;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  -- UPDATE
+  IF NEW.status <> 'approved' THEN
+    -- status moved away from approved — drop the mirror
+    IF NEW.mirrored_thought_id IS NOT NULL THEN
+      DELETE FROM thoughts WHERE id = NEW.mirrored_thought_id;
+      NEW.mirrored_thought_id := NULL;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  -- status = approved
+  IF NEW.mirrored_thought_id IS NOT NULL THEN
     UPDATE thoughts
        SET content  = wom_compose_checkpoint_content(NEW),
            metadata = wom_compose_checkpoint_metadata(NEW)
-     WHERE metadata @> v_match;
-    GET DIAGNOSTICS v_updated = ROW_COUNT;
+     WHERE id = NEW.mirrored_thought_id;
 
-    IF v_updated > 0 THEN
+    IF FOUND THEN
       RETURN NEW;
     END IF;
+    -- thought was deleted out from under us; fall through and re-create
   END IF;
 
   INSERT INTO thoughts (content, metadata)
   VALUES (
     wom_compose_checkpoint_content(NEW),
     wom_compose_checkpoint_metadata(NEW)
-  );
-
+  )
+  RETURNING id INTO v_thought_id;
+  NEW.mirrored_thought_id := v_thought_id;
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 
+CREATE OR REPLACE FUNCTION wom_mirror_checkpoint_delete()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF OLD.mirrored_thought_id IS NOT NULL THEN
+    DELETE FROM thoughts WHERE id = OLD.mirrored_thought_id;
+  END IF;
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- --------------------------------------------
+-- 5. Replace any v1.0 triggers with the new ones
+-- --------------------------------------------
+DROP TRIGGER IF EXISTS wom_mirror_entry_trigger ON operating_model_entries;
 DROP TRIGGER IF EXISTS wom_mirror_checkpoint_trigger ON operating_model_layer_checkpoints;
-CREATE TRIGGER wom_mirror_checkpoint_trigger
-  AFTER INSERT OR UPDATE OR DELETE ON operating_model_layer_checkpoints
+
+CREATE TRIGGER wom_mirror_entry_biud_trigger
+  BEFORE INSERT OR UPDATE ON operating_model_entries
+  FOR EACH ROW
+  EXECUTE FUNCTION wom_mirror_entry();
+
+CREATE TRIGGER wom_mirror_entry_ad_trigger
+  AFTER DELETE ON operating_model_entries
+  FOR EACH ROW
+  EXECUTE FUNCTION wom_mirror_entry_delete();
+
+CREATE TRIGGER wom_mirror_checkpoint_biud_trigger
+  BEFORE INSERT OR UPDATE ON operating_model_layer_checkpoints
   FOR EACH ROW
   EXECUTE FUNCTION wom_mirror_checkpoint();
 
+CREATE TRIGGER wom_mirror_checkpoint_ad_trigger
+  AFTER DELETE ON operating_model_layer_checkpoints
+  FOR EACH ROW
+  EXECUTE FUNCTION wom_mirror_checkpoint_delete();
+
 
 -- --------------------------------------------
--- One-time backfill for existing rows
+-- 6. One-time content backfill
+--    For any WOM row that still has no mirror, create one and link it.
 -- --------------------------------------------
--- Inserts mirror rows for any WOM entry/checkpoint that doesn't already
--- have one. Safe to re-run.
-
-INSERT INTO thoughts (content, metadata)
-SELECT
-  wom_compose_entry_content(e),
-  wom_compose_entry_metadata(e)
-FROM operating_model_entries e
-WHERE NOT EXISTS (
-  SELECT 1
-  FROM thoughts t
-  WHERE t.metadata @> jsonb_build_object(
-    'source', 'work_operating_model',
-    'source_table', 'operating_model_entries',
-    'source_id', e.id::text
-  )
-);
-
-INSERT INTO thoughts (content, metadata)
-SELECT
-  wom_compose_checkpoint_content(c),
-  wom_compose_checkpoint_metadata(c)
-FROM operating_model_layer_checkpoints c
-WHERE c.status = 'approved'
-  AND NOT EXISTS (
-    SELECT 1
-    FROM thoughts t
-    WHERE t.metadata @> jsonb_build_object(
-      'source', 'work_operating_model',
-      'source_table', 'operating_model_layer_checkpoints',
-      'source_id', c.id::text
+DO $$
+DECLARE
+  r operating_model_entries%ROWTYPE;
+  v_thought_id BIGINT;
+BEGIN
+  FOR r IN
+    SELECT * FROM operating_model_entries WHERE mirrored_thought_id IS NULL
+  LOOP
+    INSERT INTO thoughts (content, metadata)
+    VALUES (
+      wom_compose_entry_content(r),
+      wom_compose_entry_metadata(r)
     )
-  );
+    RETURNING id INTO v_thought_id;
+
+    UPDATE operating_model_entries
+       SET mirrored_thought_id = v_thought_id
+     WHERE id = r.id;
+  END LOOP;
+END $$;
+
+DO $$
+DECLARE
+  r operating_model_layer_checkpoints%ROWTYPE;
+  v_thought_id BIGINT;
+BEGIN
+  FOR r IN
+    SELECT * FROM operating_model_layer_checkpoints
+    WHERE mirrored_thought_id IS NULL AND status = 'approved'
+  LOOP
+    INSERT INTO thoughts (content, metadata)
+    VALUES (
+      wom_compose_checkpoint_content(r),
+      wom_compose_checkpoint_metadata(r)
+    )
+    RETURNING id INTO v_thought_id;
+
+    UPDATE operating_model_layer_checkpoints
+       SET mirrored_thought_id = v_thought_id
+     WHERE id = r.id;
+  END LOOP;
+END $$;
+
 
 -- --------------------------------------------
 -- Verification (uncomment to inspect)
 -- --------------------------------------------
--- SELECT metadata->>'type' AS type, COUNT(*) AS n
--- FROM thoughts
--- WHERE metadata @> '{"source": "work_operating_model"}'::jsonb
--- GROUP BY 1
--- ORDER BY 1;
+-- Count mirrored entries by layer
+-- SELECT layer,
+--        COUNT(*) AS total,
+--        COUNT(mirrored_thought_id) AS mirrored
+-- FROM operating_model_entries
+-- GROUP BY 1 ORDER BY 1;
+--
+-- Confirm the FK is populated everywhere expected
+-- SELECT 'entries' AS table, COUNT(*) AS total,
+--        COUNT(mirrored_thought_id) AS with_fk
+-- FROM operating_model_entries
+-- UNION ALL
+-- SELECT 'approved_checkpoints', COUNT(*),
+--        COUNT(mirrored_thought_id)
+-- FROM operating_model_layer_checkpoints WHERE status = 'approved';
