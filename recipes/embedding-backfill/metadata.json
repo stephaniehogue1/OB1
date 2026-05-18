@@ -1,0 +1,20 @@
+{
+  "name": "Embedding Backfill",
+  "description": "Scheduled Edge Function that fills missing embeddings on `thoughts` rows so trigger-mirrored and bulk-imported content becomes discoverable via `search_thoughts` (vector similarity search).",
+  "category": "recipes",
+  "author": {
+    "name": "Stephanie Hogue",
+    "github": "stephaniehogue1"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": ["Supabase", "OpenRouter"],
+    "tools": ["Supabase CLI"]
+  },
+  "tags": ["embeddings", "backfill", "search", "cron", "pg_cron", "pg_net", "vector-search"],
+  "difficulty": "intermediate",
+  "estimated_time": "10 minutes",
+  "created": "2026-05-18",
+  "updated": "2026-05-18"
+}
