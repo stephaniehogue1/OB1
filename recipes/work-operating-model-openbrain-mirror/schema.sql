@@ -5,7 +5,7 @@
 -- approved layer checkpoint into the core OpenBrain `thoughts` table. The
 -- relationship is enforced two ways:
 --
---   1. An explicit foreign key: `mirrored_thought_id BIGINT REFERENCES
+--   1. An explicit foreign key: `mirrored_thought_id UUID REFERENCES
 --      thoughts(id) ON DELETE SET NULL` on `operating_model_entries` and
 --      `operating_model_layer_checkpoints`. Visible in the Schema
 --      Visualizer.
@@ -38,11 +38,11 @@
 -- 1. Add the FK columns (idempotent)
 -- --------------------------------------------
 ALTER TABLE operating_model_entries
-  ADD COLUMN IF NOT EXISTS mirrored_thought_id BIGINT
+  ADD COLUMN IF NOT EXISTS mirrored_thought_id UUID
     REFERENCES thoughts(id) ON DELETE SET NULL;
 
 ALTER TABLE operating_model_layer_checkpoints
-  ADD COLUMN IF NOT EXISTS mirrored_thought_id BIGINT
+  ADD COLUMN IF NOT EXISTS mirrored_thought_id UUID
     REFERENCES thoughts(id) ON DELETE SET NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ome_mirrored_thought_id
@@ -183,7 +183,7 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 CREATE OR REPLACE FUNCTION wom_mirror_entry()
 RETURNS TRIGGER AS $$
 DECLARE
-  v_thought_id BIGINT;
+  v_thought_id UUID;
 BEGIN
   IF TG_OP = 'INSERT' THEN
     INSERT INTO thoughts (content, metadata)
@@ -237,7 +237,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION wom_mirror_checkpoint()
 RETURNS TRIGGER AS $$
 DECLARE
-  v_thought_id BIGINT;
+  v_thought_id UUID;
 BEGIN
   IF TG_OP = 'INSERT' THEN
     IF NEW.status = 'approved' THEN
@@ -332,7 +332,7 @@ CREATE TRIGGER wom_mirror_checkpoint_ad_trigger
 DO $$
 DECLARE
   r operating_model_entries%ROWTYPE;
-  v_thought_id BIGINT;
+  v_thought_id UUID;
 BEGIN
   FOR r IN
     SELECT * FROM operating_model_entries WHERE mirrored_thought_id IS NULL
@@ -353,7 +353,7 @@ END $$;
 DO $$
 DECLARE
   r operating_model_layer_checkpoints%ROWTYPE;
-  v_thought_id BIGINT;
+  v_thought_id UUID;
 BEGIN
   FOR r IN
     SELECT * FROM operating_model_layer_checkpoints
