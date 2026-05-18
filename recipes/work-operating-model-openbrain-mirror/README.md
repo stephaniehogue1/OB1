@@ -8,7 +8,7 @@ The [Work Operating Model Activation](../work-operating-model-activation/) recip
 
 This recipe creates a two-way connection:
 
-1. **A foreign key column** — `mirrored_thought_id BIGINT REFERENCES thoughts(id) ON DELETE SET NULL` is added to both WOM tables. Visible in **Database → Schema Visualizer**.
+1. **A foreign key column** — `mirrored_thought_id UUID REFERENCES thoughts(id) ON DELETE SET NULL` is added to both WOM tables. Visible in **Database → Schema Visualizer**.
 
 2. **Database triggers** — On every INSERT/UPDATE/DELETE the WOM table receives, the corresponding row in `thoughts` is created/updated/removed, and the FK is populated. Same transaction; cannot drift.
 
